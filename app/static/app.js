@@ -15,11 +15,20 @@ const state = {
   judgments: [],          // [{a, b, type}]，a/b 为框号
   params: { w_dist: 1, w_app: 10000, penalty: 15000 },
   images: [],             // HTMLImageElement
+  frameSizes: [],         // 每帧 [w, h]；null 表示解码失败
+  localizeMaxDim: 1024,
   currentFrame: 0,
   selection: [],          // 已选框号（至多 2 个）
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  // 漏检定位：候选只在 会话 + 输入版本 + 当前选中的轨迹相邻框 均匹配时展示
+  candidate: null,        // {rect, frame, score, ...}
+  candidateKey: null,     // `${version}|${targetKey}`
+  candidateToken: 0,      // 每次请求/输入/判断/参数变化都 +1，迟到的响应直接丢弃
+  localizeBusy: false,
+  localizeNotice: null,   // 最近一次“不能可靠定位”的原因（仅供当前选择展示）
+  localizeNoticeKey: null,// 该原因对应的 `${version}|${targetKey}`
 };
 
 const $ = (id) => document.getElementById(id);
@@ -68,11 +77,14 @@ function loadSession(payload) {
   state.detections = payload.detections;
   state.judgments = payload.judgments;
   state.params = payload.params;
+  state.frameSizes = payload.frame_sizes || [];
+  state.localizeMaxDim = (payload.limits && payload.limits.localize_max_dim) || 1024;
   state.currentFrame = 0;
   state.selection = [];
   state.result = null;
   state.jobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  clearCandidate({ silent: true });
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -162,6 +174,30 @@ function draw() {
     ctx.fillStyle = color;
     ctx.fillText(label, x + 3, ly + 12);
   }
+
+  drawCandidate();
+}
+
+/* 漏检候选以虚线框叠加在当前帧；不参与检测/轨迹/计数。 */
+function drawCandidate() {
+  const c = activeCandidate();
+  if (!c || !c.candidate || c.candidate.frame !== state.currentFrame) return;
+  const [x, y, w, h] = c.candidate.rect;
+  ctx.save();
+  ctx.setLineDash([8, 5]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#ff5cf0";
+  ctx.strokeRect(x, y, w, h);
+  ctx.setLineDash([]);
+  const label = `疑似漏检 ${c.candidate.rect.map((v) => v.toFixed(1)).join(", ")}`;
+  ctx.font = "bold 12px sans-serif";
+  const tw = ctx.measureText(label).width;
+  const ly = y + h + 4;
+  ctx.fillStyle = "rgba(0,0,0,0.75)";
+  ctx.fillRect(x, ly, tw + 6, 15);
+  ctx.fillStyle = "#ff9bf5";
+  ctx.fillText(label, x + 3, ly + 12);
+  ctx.restore();
 }
 
 function renderFrameNav() {
@@ -195,6 +231,8 @@ function renderSelection() {
     if (state.selection.length === 2) {
       const j = findJudgment(state.selection[0], state.selection[1]);
       if (j) text += `（当前判断：${j.type === "same" ? "同只" : "异只"}）`;
+      const tk = selectedTarget();
+      if (tk) text += `（同一轨迹相邻两框，帧差 2：可定位中间帧漏检）`;
     }
     info.textContent = text;
   }
@@ -202,6 +240,7 @@ function renderSelection() {
   $("mark-same").disabled = !two;
   $("mark-diff").disabled = !two;
   $("mark-clear").disabled = !two || !findJudgment(state.selection[0], state.selection[1]);
+  renderLocalizeControls();
 }
 
 function findJudgment(a, b) {
@@ -234,8 +273,21 @@ function toggleSelect(id) {
     if (state.selection.length >= 2) state.selection.shift();
     state.selection.push(id);
   }
+  invalidateCandidateForSelection();
   renderSelection();
   draw();
+}
+
+/* 选择变化后，旧候选的“选中两框”前提不再成立，立即撤下并使在途请求作废。 */
+function invalidateCandidateForSelection() {
+  if (state.candidate || state.localizeBusy) {
+    invalidateCandidate("选择已变化，候选已撤下。");
+  } else {
+    state.localizeNotice = null;
+    state.localizeNoticeKey = null;
+    state.candidateToken += 1;
+    renderLocalizeControls();
+  }
 }
 
 async function setJudgment(type) {
@@ -245,6 +297,7 @@ async function setJudgment(type) {
   const rest = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   const next = type ? [...rest, { a, b, type }] : rest;
   invalidateResult(); // 修改即撤下旧结果
+  invalidateCandidate("判断已修改，候选已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
       method: "PUT",
@@ -265,6 +318,7 @@ async function removeJudgment(a, b) {
   const key = pairKey(a, b);
   const next = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   invalidateResult();
+  invalidateCandidate("判断已删除，候选已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
       method: "PUT",
@@ -302,7 +356,190 @@ function renderJudgments() {
   }
 }
 
-/* ------------------------------------------------------------ 参数 */
+/* ------------------------------------------------------------ 漏检定位 */
+
+/* 选中两框须都在当前可行最优轨迹中，同属一条轨迹且相邻（帧差 2）。
+   返回用于校验迟到/失效结果的签名，或 null。 */
+function selectedTarget() {
+  const r = state.result;
+  if (!r || !r.feasible || state.selection.length !== 2) return null;
+  const [a, b] = state.selection;
+  for (let ti = 0; ti < r.trajectories.length; ti++) {
+    const t = r.trajectories[ti];
+    const ia = t.boxes.findIndex((x) => x.id === a);
+    const ib = t.boxes.findIndex((x) => x.id === b);
+    if (ia < 0 || ib < 0) continue;
+    const i0 = Math.min(ia, ib);
+    const i1 = Math.max(ia, ib);
+    if (i1 - i0 !== 1) return null;
+    const f0 = t.boxes[i0].frame;
+    const f1 = t.boxes[i1].frame;
+    if (f1 - f0 !== 2) return null;
+    return {
+      key: `${state.version}|${t.boxes[i0].id}|${t.boxes[i1].id}|${f0}|${f1}`,
+      leftId: t.boxes[i0].id,
+      rightId: t.boxes[i1].id,
+      midFrame: f0 + 1,
+    };
+  }
+  return null;
+}
+
+function activeCandidate() {
+  if (!state.candidate) return null;
+  const target = selectedTarget();
+  if (!target || state.candidateKey !== `${state.version}|${target.key}`) return null;
+  return state.candidate;
+}
+
+function clearCandidate({ silent = false } = {}) {
+  const had = state.candidate !== null;
+  state.candidate = null;
+  state.candidateKey = null;
+  state.localizeNotice = null;
+  state.localizeNoticeKey = null;
+  state.candidateToken += 1;   // 使所有在途定位响应失效
+  state.localizeBusy = false;
+  renderLocalizeControls();
+  if (!silent) {
+    setLocalizeStatus(had ? "候选已撤下。" : "尚无候选。", "muted");
+  }
+  draw();
+}
+
+/* 输入（判断/参数/会话/结果）变化：撤下候选并使在途请求作废。 */
+function invalidateCandidate(reason) {
+  const had = state.candidate !== null || state.localizeBusy;
+  state.candidate = null;
+  state.candidateKey = null;
+  state.localizeNotice = null;
+  state.localizeNoticeKey = null;
+  state.candidateToken += 1;
+  state.localizeBusy = false;
+  renderLocalizeControls();
+  if (had) setLocalizeStatus(reason || "输入变化，候选已撤下。", "muted");
+}
+
+function setLocalizeStatus(text, cls) {
+  const el = $("localize-status");
+  el.textContent = text;
+  el.classList.toggle("muted", cls === "muted");
+  el.style.color = cls === "err" ? "#ff9d97" : cls === "warn" ? "#ffd887" : "";
+}
+
+function renderLocalizeControls() {
+  const target = selectedTarget();
+  const active = activeCandidate();
+  $("localize-btn").disabled = !target || state.localizeBusy;
+  $("localize-clear").disabled = !active && !state.localizeBusy;
+  if (state.localizeBusy) return;
+  if (active) {
+    setLocalizeStatus(
+      `已在帧 ${active.mid_frame} 定位候选：${active.candidate.rect.map((v) => v.toFixed(1)).join(", ")}` +
+      `（两侧 IoU ${active.evidence.agreement_iou.toFixed(2)}，` +
+      `左/右得分 ${active.evidence.left.score.toFixed(2)} / ${active.evidence.right.score.toFixed(2)}）。` +
+      `仅叠加显示，未改动检测、轨迹或计数。`,
+      "ok"
+    );
+  } else if (target && state.localizeNotice && state.localizeNoticeKey ===
+             `${state.version}|${target.key}`) {
+    setLocalizeStatus(`不能可靠定位：${state.localizeNotice}`, "err");
+  } else if (target) {
+    setLocalizeStatus(
+      `可定位：帧 ${target.midFrame} 为中间帧（选中帧差 2 的相邻框）。`,
+      "muted"
+    );
+  } else if (state.result && state.result.feasible && state.selection.length === 2) {
+    setLocalizeStatus("请选中当前可行最优轨迹中相邻（帧差 2）的两个框。", "warn");
+  } else {
+    setLocalizeStatus("需先得到可行最优结果，并选中轨迹中帧差 2 的相邻两框。", "muted");
+  }
+}
+
+/* 前端预检：相关三帧中任一解码失败或超过 1024×1024 时直接提示不能定位。 */
+function precheckLocalize(target) {
+  const frames = [target.midFrame - 1, target.midFrame, target.midFrame + 1];
+  const names = ["前一帧", "中间帧", "后一帧"];
+  for (let k = 0; k < frames.length; k++) {
+    const size = state.frameSizes[frames[k]];
+    if (!size) {
+      return `${names[k]}图像解码失败，不能定位。`;
+    }
+    if (size[0] > state.localizeMaxDim || size[1] > state.localizeMaxDim) {
+      return `${names[k]}图像尺寸 ${size[0]}×${size[1]} 超过 1024×1024，不能定位。`;
+    }
+  }
+  return null;
+}
+
+async function requestLocalize() {
+  const target = selectedTarget();
+  if (!target || !state.sessionId) return;
+  const token = ++state.candidateToken;
+  const sid = state.sessionId;
+  const version = state.version;
+  // 立刻撤下旧候选（不能在请求期间继续显示过期框）
+  state.candidate = null;
+  state.candidateKey = null;
+  setLocalizeStatus("定位中…", "muted");
+  renderLocalizeControls();
+  draw();
+  const pre = precheckLocalize(target);
+  if (pre) {
+    state.localizeNotice = pre;
+    state.localizeNoticeKey = `${version}|${target.key}`;
+    renderLocalizeControls();
+    draw();
+    return;
+  }
+  state.localizeNotice = null;
+  state.localizeNoticeKey = null;
+  state.localizeBusy = true;
+  renderLocalizeControls();
+  draw();
+
+  try {
+    const resp = await api(`/api/sessions/${sid}/localize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ left_id: target.leftId, right_id: target.rightId, version }),
+    });
+    // 迟到/失效响应：会话、输入版本、请求令牌、选中的两框任一变化都丢弃。
+    if (token !== state.candidateToken || sid !== state.sessionId ||
+        version !== state.version) return;
+    const still = selectedTarget();
+    if (!still || still.key !== target.key) return;
+
+    state.localizeBusy = false;
+    if (!resp.locatable) {
+      state.candidate = null;
+      state.candidateKey = null;
+      state.localizeNotice = resp.message;
+      state.localizeNoticeKey = `${version}|${target.key}`;
+      renderLocalizeControls();
+      draw();
+      return;
+    }
+    if (resp.version !== version) return;  // 后端版本校验兜底
+    state.localizeNotice = null;
+    state.localizeNoticeKey = null;
+    state.candidate = resp;
+    state.candidateKey = `${version}|${target.key}`;
+    if (state.currentFrame !== resp.mid_frame) {
+      state.currentFrame = resp.mid_frame;
+      renderFrameNav();
+    }
+    renderLocalizeControls();
+    draw();
+  } catch (err) {
+    if (token !== state.candidateToken) return;
+    state.localizeBusy = false;
+    state.localizeNotice = `定位失败：${err.message}`;
+    state.localizeNoticeKey = `${version}|${target.key}`;
+    renderLocalizeControls();
+    draw();
+  }
+}
 
 async function applyParams() {
   if (!state.sessionId) return;
@@ -314,6 +551,7 @@ async function applyParams() {
     return;
   }
   invalidateResult(); // 修改即撤下旧结果
+  invalidateCandidate("参数已修改，候选已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/params`, {
       method: "PUT",
@@ -322,6 +560,7 @@ async function applyParams() {
     });
     state.version = resp.version;
     state.params = { w_dist: wDist, w_app: wApp, penalty };
+    renderLocalizeControls();
   } catch (err) {
     alert(`保存参数失败：${err.message}`);
   }
@@ -339,6 +578,8 @@ function invalidateResult() {
     $("trajectory-list").innerHTML = "";
     draw();
   }
+  invalidateCandidate("结果已撤下，候选已撤下。");
+  renderLocalizeControls();
 }
 
 async function solve() {
@@ -385,6 +626,10 @@ async function pollJob(jobId) {
     status.style.color = "";
     state.result = job.result;
     renderResult();
+    if (state.result && !state.result.feasible) {
+      invalidateCandidate("无解结果，候选已撤下。");
+    }
+    renderLocalizeControls();
     draw();
   } catch (err) {
     showError("solve-status", err);
@@ -453,6 +698,8 @@ $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("localize-btn").addEventListener("click", requestLocalize);
+$("localize-clear").addEventListener("click", () => clearCandidate());
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

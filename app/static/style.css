@@ -136,6 +136,14 @@ button.secondary { background: transparent; }
 
 #selection-info { margin: 8px 0 4px; font-size: 13px; }
 
+#localize-panel {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 4px;
+}
+#localize-panel .btn-row { margin-top: 6px; }
+#localize-status { margin-top: 6px; line-height: 1.6; }
+
 #judgment-list {
   list-style: none;
   margin: 6px 0 0;

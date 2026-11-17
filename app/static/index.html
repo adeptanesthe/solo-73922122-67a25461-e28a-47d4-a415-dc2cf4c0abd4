@@ -69,6 +69,18 @@
         <button id="mark-diff" disabled>标记为异只</button>
         <button id="mark-clear" disabled>清除该对判断</button>
       </div>
+      <div id="localize-panel">
+        <h3>中间帧漏检定位</h3>
+        <div class="muted small">
+          点选当前可行最优轨迹中帧号相差 2 的相邻两框，再点击“定位中间帧漏检”。
+          候选只叠加显示，不改检测 JSON、轨迹或计数。
+        </div>
+        <div class="btn-row">
+          <button id="localize-btn" disabled>定位中间帧漏检</button>
+          <button id="localize-clear" class="secondary" disabled>撤下候选</button>
+        </div>
+        <div id="localize-status" class="muted small">尚未定位。</div>
+      </div>
       <div id="judgment-panel">
         <h3>当前身份判断 <span id="judgment-count" class="muted"></span></h3>
         <ul id="judgment-list"></ul>

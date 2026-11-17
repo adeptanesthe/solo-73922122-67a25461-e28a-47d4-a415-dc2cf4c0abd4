@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import math
 import uuid
@@ -18,9 +19,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
+from .localize import MAX_DIM, CannotLocate, load_rgb, locate_missed
 from .solver import InputConflict, solve_tracking
 
 MAX_FRAMES = 10
@@ -125,6 +128,15 @@ def _validate_detections(payload, n_frames: int):
     return out
 
 
+def _frame_size(data: bytes):
+    """尽力读取图像尺寸；解码失败时返回 None（定位时会给出明确提示）。"""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return [im.width, im.height]
+    except Exception:  # noqa: BLE001 - 上传阶段不因坏图阻断其它功能
+        return None
+
+
 def _new_session(frames, detections) -> dict:
     sid = uuid.uuid4().hex[:12]
     sess = {
@@ -134,6 +146,7 @@ def _new_session(frames, detections) -> dict:
         "detections": detections,
         "judgments": [],
         "params": dict(DEFAULT_PARAMS),
+        "frame_sizes": [_frame_size(data) for _, data in frames],
     }
     SESSIONS[sid] = sess
     return sess
@@ -147,7 +160,10 @@ def _payload(sess: dict) -> dict:
         "detections": sess["detections"],
         "judgments": sess["judgments"],
         "params": sess["params"],
-        "limits": {"frames": MAX_FRAMES, "detections": MAX_DETECTIONS},
+        # 漏检定位会解码帧图；前端据此提示不可定位（后端同时会拒绝）。
+        "frame_sizes": sess["frame_sizes"],
+        "limits": {"frames": MAX_FRAMES, "detections": MAX_DETECTIONS,
+                   "localize_max_dim": MAX_DIM},
     }
 
 
@@ -307,6 +323,82 @@ async def get_job(job_id: str):
     if job is None:
         _err(404, "求解任务不存在。")
     return job
+
+
+# ---------------------------------------------------------------- 漏检定位
+
+class LocalizeBody(BaseModel):
+    left_id: str
+    right_id: str
+    version: int          # 前端发起时的输入版本，用于丢弃迟到结果
+
+
+@app.post("/api/sessions/{sid}/localize")
+async def localize(sid: str, body: LocalizeBody):
+    """在轨迹相邻两框（帧差 2）的中间帧定位漏检候选。
+
+    只读操作：不修改检测、轨迹、判断、参数或版本号；返回的 ``version``
+    是请求时的输入版本，前端须与当前版本比对后再展示候选。
+    """
+    sess = _get_session(sid)
+    if body.version != sess["version"]:
+        _err(409, "输入已变化（版本不一致），本次定位结果作废。")
+
+    by_id = {d["id"]: d for d in sess["detections"]}
+    left = by_id.get(body.left_id)
+    right = by_id.get(body.right_id)
+    if left is None or right is None:
+        _err(400, "定位引用了不存在的检测框。")
+    if left["id"] == right["id"]:
+        _err(400, "请选择两个不同的检测框。")
+    if abs(left["frame"] - right["frame"]) != 2:
+        _err(400, "只能对帧号相差 2 的两个框做中间帧漏检定位。")
+
+    if left["frame"] > right["frame"]:
+        left, right = right, left
+    lf, rf = left["frame"], right["frame"]
+    if not (0 <= lf < len(sess["frames"]) and 0 <= rf < len(sess["frames"])):
+        _err(400, "检测框帧号超出图片范围。")
+    mid_frame = lf + 1
+
+    # 尺寸预检：任一相关图片超过 1024×1024 或无法获得尺寸 → 不解码、不定位。
+    for f, label in ((lf, "前一帧"), (mid_frame, "中间帧"), (rf, "后一帧")):
+        size = sess["frame_sizes"][f]
+        if size is None:
+            return JSONResponse(status_code=200, content={
+                "locatable": False, "code": "decode_failed", "version": body.version,
+                "message": f"{label}图像解码失败，不能定位。",
+            })
+        if size[0] > MAX_DIM or size[1] > MAX_DIM:
+            return JSONResponse(status_code=200, content={
+                "locatable": False, "code": "image_too_large", "version": body.version,
+                "message": f"{label}图像尺寸 {size[0]}×{size[1]} 超过 1024×1024，不能定位。",
+            })
+
+    try:
+        left_img = load_rgb(sess["frames"][lf][1], "前一帧")
+        mid_img = load_rgb(sess["frames"][mid_frame][1], "中间帧")
+        right_img = load_rgb(sess["frames"][rf][1], "后一帧")
+        mid_rects = [d["rect"] for d in sess["detections"] if d["frame"] == mid_frame]
+        # NCC 搜索是 CPU 密集的（≤1024²，约 1~3 秒），放到线程池避免阻塞事件循环。
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            EXECUTOR, locate_missed,
+            left_img, mid_img, right_img,
+            left["rect"], right["rect"], mid_frame, mid_rects,
+            lf, rf,
+        )
+    except CannotLocate as exc:
+        return JSONResponse(status_code=200, content={
+            "locatable": False, "code": exc.code, "version": body.version,
+            "message": exc.message,
+        })
+
+    result["version"] = body.version
+    result["left"] = {"id": left["id"], "frame": lf, "rect": left["rect"]}
+    result["right"] = {"id": right["id"], "frame": rf, "rect": right["rect"]}
+    result["mid_frame"] = mid_frame
+    return result
 
 
 # ---------------------------------------------------------------- 页面
